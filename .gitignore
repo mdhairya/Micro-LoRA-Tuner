@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+tuned-model-lora/
+merged-local-model/
+*.safetensors
