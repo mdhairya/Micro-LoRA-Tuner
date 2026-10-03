@@ -1,0 +1,19 @@
+# Micro-LoRA-Tuner
+
+A streamlined, production-ready implementation of Parameter-Efficient Fine-Tuning (PEFT) using QLoRA. 
+
+Designed to fine-tune foundation models (like 0.5B parameter instruction models) on consumer hardware by utilizing 4-bit NormalFloat quantization, Gradient Checkpointing, and Paged Optimizers, all consolidated into a clean, flat architecture.
+
+## Project Structure
+
+```text
+Micro-LoRA-Tuner/
+├── train_sft.py      # Contains all config, data prep, and training logic
+├── export.py         # Script to merge adapter weights for local inference
+├── requirements.txt
+├── .gitignore
+└── README.md
+
+pip install -r requirements.txt
+python train_sft.py
+python export.py
