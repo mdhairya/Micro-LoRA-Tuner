@@ -1,23 +1,57 @@
 import os
-import torch
 import argparse
+import torch
 from datasets import load_dataset
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
+    AutoModelForCausalLM, 
+    AutoTokenizer, 
+    TrainingArguments, 
     BitsAndBytesConfig,
-    TrainingArguments,
     set_seed
 )
 from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training
+    get_peft_model, 
+    prepare_model_for_kbit_training, 
+    LoraConfig
 )
 from trl import SFTTrainer
 
+def get_quantization_config() -> BitsAndBytesConfig:
+    """Returns optimal 4-bit NormalFloat configuration for memory-efficient training."""
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True
+    )
+
+def get_lora_config(r: int = 16, alpha: int = 32) -> LoraConfig:
+    """Returns LoRA config targeting both Attention and MLP layers."""
+    return LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj", # Attention
+            "gate_proj", "up_proj", "down_proj"     # MLP
+        ]
+    )
+
+def prepare_chat_dataset(dataset_id: str, tokenizer, split: str = "train"):
+    """Loads a dataset and applies the model's native chat template."""
+    print(f"Loading dataset: {dataset_id}")
+    dataset = load_dataset(dataset_id, split=split)
+
+    def format_chat_template(example):
+        example["text"] = tokenizer.apply_chat_template(example["messages"], tokenize=False)
+        return example
+
+    return dataset.map(format_chat_template, num_proc=os.cpu_count())
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Advanced QLoRA SFT Pipeline")
+    parser = argparse.ArgumentParser(description="Run QLoRA Supervised Fine-Tuning")
     parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--dataset_id", type=str, default="philschmid/dolly-15k-oai-style")
     parser.add_argument("--output_dir", type=str, default="./tuned-model-lora")
@@ -27,91 +61,64 @@ def main():
     args = parse_args()
     set_seed(42)
 
-    print(f"Loading Tokenizer for {args.model_id}...")
+    # 1. Setup Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right" # Fixes strange behaviors with fp16 training
+    tokenizer.padding_side = "right"
 
-    # 1. Advanced 4-Bit Quantization Config
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",           # NormalFloat 4 - mathematically optimal for weights
-        bnb_4bit_compute_dtype=torch.bfloat16, # Compute in bfloat16 to maintain speed/stability
-        bnb_4bit_use_double_quant=True       # Secondary quantization to save extra VRAM
-    )
-
-    print("Loading Base Model...")
+    # 2. Setup Model with 4-bit Quantization
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        quantization_config=bnb_config,
+        quantization_config=get_quantization_config(),
         device_map="auto",
         trust_remote_code=True
     )
-
-    # 2. Prepare for memory-efficient training
-    model.config.use_cache = False # Required for gradient checkpointing
+    
+    # Enable gradient checkpointing for memory efficiency
+    model.config.use_cache = False 
     model = prepare_model_for_kbit_training(model)
 
-    # 3. LoRA Configuration (Targeting Attention + MLP)
-    peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj", # Attention
-            "gate_proj", "up_proj", "down_proj"     # MLP
-        ]
-    )
-    model = get_peft_model(model, peft_config)
+    # 3. Apply LoRA Adapters
+    model = get_peft_model(model, get_lora_config())
     model.print_trainable_parameters()
 
-    # 4. Load Dataset
-    print(f"Loading Dataset {args.dataset_id}...")
-    dataset = load_dataset(args.dataset_id, split="train")
+    # 4. Prepare Data
+    dataset = prepare_chat_dataset(args.dataset_id, tokenizer)
 
-    def format_chat_template(example):
-        # Applies the model's native chat template (e.g., ChatML) to the raw messages
-        example["text"] = tokenizer.apply_chat_template(example["messages"], tokenize=False)
-        return example
-
-    dataset = dataset.map(format_chat_template, num_proc=os.cpu_count())
-
-    # 5. Advanced Training Arguments
+    # 5. Define Training Hyperparameters
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,       # Effective batch size = 16
-        gradient_checkpointing=True,         # Trades compute for VRAM 
-        optim="paged_adamw_8bit",            # Pages optimizer states to CPU RAM if GPU runs out
+        gradient_accumulation_steps=4,
+        gradient_checkpointing=True,
+        optim="paged_adamw_8bit",
         learning_rate=2e-4,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         max_grad_norm=0.3,
         num_train_epochs=3,
-        bf16=True,                           # Faster than fp16 on Ampere+ GPUs
+        bf16=True,
         logging_steps=10,
         save_strategy="epoch",
-        neftune_noise_alpha=5.0,             # Adds noise to embeddings, improving instruction adherence
-        report_to="none"                     # Set to "wandb" for real tracking
+        neftune_noise_alpha=5.0,
+        report_to="none" 
     )
 
-    # 6. Initialize SFTTrainer
+    # 6. Initialize and Run Trainer
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset,
-        peft_config=peft_config,
+        peft_config=get_lora_config(),
         dataset_text_field="text",
         max_seq_length=1024,
         tokenizer=tokenizer,
         args=training_args,
     )
 
-    print("Starting Training...")
+    print("Starting SFT Training...")
     trainer.train()
     
-    print("Saving Final Adapter...")
+    print(f"Saving finalized adapter to {args.output_dir}/final_adapter")
     trainer.model.save_pretrained(f"{args.output_dir}/final_adapter")
     tokenizer.save_pretrained(f"{args.output_dir}/final_adapter")
 
